@@ -145,8 +145,18 @@ def render_msc_html(self, node, code):
     raise nodes.SkipNode
 
 
+def render_msc_html_js(self, node, code):
+    self.body.append(self.starttag(node, 'script', type='text/x-mscgen', **{'data-named-style': 'classic'}))
+    self.body.append(self.encode(code))
+    self.body.append('</script>')
+    raise nodes.SkipNode
+
+
 def html_visit_mscgen(self, node):
-    render_msc_html(self, node, node['code'])
+    if self.builder.config.mscgen_js is not None:
+        render_msc_html_js(self, node, node['code'])
+    else:
+        render_msc_html(self, node, node['code'])
 
 
 def render_msc_latex(self, code):
@@ -159,6 +169,12 @@ def render_msc_latex(self, code):
 def latex_visit_mscgen(self, node):
     render_msc_latex(self, node['code'])
 
+
+def builder_inited(app):
+    if app.config.mscgen_js is not None:
+        app.add_javascript(app.config.mscgen_js)
+
+
 def setup(app):
     app.add_node(mscgen,
                  html=(html_visit_mscgen, None),
@@ -167,3 +183,5 @@ def setup(app):
     app.add_directive('msc', MscgenSimple)
     app.add_config_value('mscgen', 'mscgen', 'html')
     app.add_config_value('mscgen_args', [], 'html')
+    app.add_config_value('mscgen_js', None, 'html')
+    app.connect('builder-inited', builder_inited)
