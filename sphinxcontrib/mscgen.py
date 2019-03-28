@@ -12,21 +12,23 @@
     :license: BOLA, see LICENSE for details.
 """
 
-import errno
+import os
 import sys
-import posixpath
-from os import path
 from subprocess import Popen, PIPE
-try:
-    from hashlib import sha1 as sha
-except ImportError:
-    from sha import sha
+from uuid import uuid4
 
 from docutils import nodes
 
 from sphinx.errors import SphinxError
 from sphinx.util import ensuredir
 from docutils.parsers.rst import Directive
+
+
+try:
+    import cairosvg
+    preferred_formats = ['image/svg+xml', 'application/pdf', 'image/png']
+except:
+    preferred_formats = ['image/svg+xml', 'image/png']
 
 
 class MscgenError(SphinxError):
@@ -69,123 +71,76 @@ class MscgenSimple(Directive):
         return [node]
 
 
-def run_cmd(builder, cmd, cmd_name, cfg_name, stdin=''):
-    try:
-        try:
-            p = Popen(cmd, stdout=PIPE, stdin=PIPE, stderr=PIPE)
-        except OSError as err:
-            # workaround for missing shebang of epstopdf script
-            if err.errno != getattr(errno, 'ENOEXEC', 0):
-                raise
-            p = Popen(cmd, shell=True, stdout=PIPE, stdin=PIPE, stderr=PIPE)
-    except OSError as err:
-        if err.errno != 2:   # No such file or directory
-            raise
-        builder.warn('%s command %r cannot be run (needed for mscgen '
-                          'output), check the %s setting' %
-                          (cmd_name, builder.config.mscgen, cfg_name))
-        builder._mscgen_warned = True
-        return False
-    stdout, stderr = p.communicate(stdin)
-    if p.returncode != 0:
-        raise MscgenError('%s exited with error:\n[stderr]\n%s\n'
-                            '[stdout]\n%s' % (cmd_name, stderr, stdout))
-    return True
+def determine_format(supported):
+    for fmt in preferred_formats:
+        if fmt in supported:
+            return fmt
+    return None
 
 
-def eps_to_pdf(builder, epsfn, pdffn):
-    epstopdf_args = [builder.config.mscgen_epstopdf]
-    epstopdf_args.extend(builder.config.mscgen_epstopdf_args)
-    epstopdf_args.extend(['--outfile=' + pdffn, epsfn])
-    return run_cmd(builder, epstopdf_args, 'epstopdf', 'mscgen_epstopdf')
-
-
-def get_map_code(mapfn, id):
-    mapfile = open(mapfn)
-    try:
-        lines = mapfile.readlines()
-    finally:
-        mapfile.close()
-    mapcode = '<map id="%s" name="%s">' % (id, id)
-    for line in lines:
-        (type, name, coords) = line.split(' ', 2)
-        mapcode += '<area shape="%s" href="%s" alt="" coords="%s" />' % (
-                    type, name, coords)
-    mapcode += '</map>'
-    return mapcode
-
-
-def render_msc(self, code, format, prefix='mscgen'):
-    """
-    Render mscgen code into a PNG or PDF output file.
-    """
-    hashkey = (code + str(self.builder.config.mscgen_args)).encode('utf-8')
-    id = sha(hashkey).hexdigest()
-    fname = '%s-%s.%s' % (prefix, id, format)
-    if hasattr(self.builder, 'imgpath'):
-        # HTML
-        relfn = posixpath.join(self.builder.imgpath, fname)
-        outfn = path.join(self.builder.outdir, '_images', fname)
-        tmpfn = outfn
-        mapfn = outfn + '.map'
-    else:
-        # LaTeX
-        relfn = fname
-        outfn = path.join(self.builder.outdir, fname)
-        format = 'eps'
-        tmpfn = outfn[:-3] + format
-
-    if path.isfile(outfn):
-        return relfn, outfn, id
-
-    if hasattr(self.builder, '_mscgen_warned'):
-        return None, None, None
-
-    ensuredir(path.dirname(outfn))
-
-    # mscgen don't support encodings very well. ISO-8859-1 seems to work best,
-    # at least for PNG.
-    code = code.encode('iso-8859-1')
-
+def render_msc_native(self, code, fmt='svg'):
     mscgen_args = [self.builder.config.mscgen]
     mscgen_args.extend(self.builder.config.mscgen_args)
-    mscgen_args.extend(['-T', format, '-o', tmpfn])
-    if not run_cmd(self.builder, mscgen_args, 'mscgen', 'mscgen', code):
-        return None, None, None
+    mscgen_args.extend(['-T', fmt, '-o', '-'])
 
-    if format == 'png':
-        mscgen_args = mscgen_args[:-4] + ['-T', 'ismap', '-o', mapfn]
-        if not run_cmd(self.builder, mscgen_args, 'mscgen', 'mscgen', code):
-            return None, None, None
-    else: # PDF/EPS
-        if not eps_to_pdf(self.builder, tmpfn, outfn):
-            return None, None, None
-
-    return relfn, outfn, id
-
-
-def render_msc_html(self, node, code, prefix='mscgen', imgcls=None):
     try:
-        fname, outfn, id = render_msc(self, code, 'png', prefix)
-    except MscgenError as exc:
-        self.builder.warn('mscgen code %r: ' % code + str(exc))
-        raise nodes.SkipNode
+        p = Popen(mscgen_args, stdout=PIPE, stdin=PIPE, stderr=PIPE)
+    except OSError as err:
+        raise
+    img, err = p.communicate(code.encode('iso-8859-1'))
+    if p.returncode != 0:
+        raise MscgenError('Cannot render the following mscgen code:\n%s\n\nError: %s'.format(code, err))
+    return img
 
-    self.body.append(self.starttag(node, 'p', CLASS='mscgen'))
-    if fname is None:
-        self.body.append(self.encode(code))
+
+def render_msc(self, code, outpath, fmt):
+    ensuredir(outpath)
+
+    bname = '%s-%s' % ('mscgen', uuid4())
+
+    # PNG can be directly written
+    if fmt == 'image/png':
+        ext = 'png'
+        fpath = os.path.join(outpath, '%s.%s' % (bname, ext))
+        png = render_msc_native(self, code, fmt='png')
+        with open(fpath, 'wb') as out:
+            out.write(png)
+        return bname, ext
+
+    # Create SVG
+    svg = render_msc_native(self, code, fmt='svg')
+
+    # SVG can be directly written
+    if fmt == 'image/svg+xml':
+        ext = 'svg'
+        fpath = os.path.join(outpath, '%s.%s' % (bname, ext))
+        with open(fpath, 'wb') as out:
+            out.write(svg)
+        return bname, ext
+
+    # Use CairoSVG to convert SVG to PDF
+    if fmt == 'application/pdf':
+        ext = 'pdf'
+        fpath = os.path.join(outpath, '%s.%s' % (bname, ext))
+        cairosvg.svg2pdf(svg, write_to=fpath)
+        return bname, ext
+
+    raise MscGenError("No valid mscgen conversion supplied")
+
+
+def render_msc_html(self, node, code):
+    if hasattr(self.builder, 'imgpath') and self.builder.imgpath:
+        imgpath = self.builder.imgpath
     else:
-        imgmap = get_map_code(outfn + '.map', id)
-        imgcss = imgcls and 'class="%s"' % imgcls or ''
-        if not imgmap:
-            # nothing in image map
-            self.body.append('<img src="%s" alt="%s" %s/>\n' %
-                             (fname, self.encode(code).strip(), imgcss))
-        else:
-            # has a map
-            self.body.append('<img src="%s" alt="%s" usemap="#%s" %s/>\n' %
-                             (fname, self.encode(code).strip(), id, imgcss))
-            self.body.extend(imgmap)
+        imgpath = '.'
+    outdir = os.path.join(self.builder.outdir, imgpath)
+
+    fn, ext = render_msc(self, code, outdir,
+            determine_format(self.builder.supported_image_types))
+
+    self.body.append(self.starttag(node, 'p', **{'class': 'mscgen'}))
+    self.body.append('<img src="%s.%s" alt="%s"/>\n' %
+            (os.path.join(imgpath, fn), ext, self.encode(code).strip()))
     self.body.append('</p>\n')
     raise nodes.SkipNode
 
@@ -194,20 +149,15 @@ def html_visit_mscgen(self, node):
     render_msc_html(self, node, node['code'])
 
 
-def render_msc_latex(self, node, code, prefix='mscgen'):
-    try:
-        fname, outfn, id = render_msc(self, code, 'pdf', prefix)
-    except MscgenError as exc:
-        self.builder.warn('mscgen code %r: ' % code + str(exc))
-        raise nodes.SkipNode
-
-    if fname is not None:
-        self.body.append('\n\\includegraphics[]{%s}\n' % fname)
+def render_msc_latex(self, code):
+    fn, ext = render_msc(self, code, self.builder.outdir,
+            determine_format(self.builder.supported_image_types))
+    self.body.append('\n\\noindent\\sphinxincludegraphics{{%s}.%s}\n' % (fn, ext))
     raise nodes.SkipNode
 
 
 def latex_visit_mscgen(self, node):
-    render_msc_latex(self, node, node['code'])
+    render_msc_latex(self, node['code'])
 
 def setup(app):
     app.add_node(mscgen,
@@ -217,6 +167,3 @@ def setup(app):
     app.add_directive('msc', MscgenSimple)
     app.add_config_value('mscgen', 'mscgen', 'html')
     app.add_config_value('mscgen_args', [], 'html')
-    app.add_config_value('mscgen_epstopdf', 'epstopdf', 'html')
-    app.add_config_value('mscgen_epstopdf_args', [], 'html')
-
